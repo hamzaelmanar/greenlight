@@ -1,0 +1,7 @@
+greenlight_transform:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('GREENLIGHT_DB_PATH', '../data/greenlight.duckdb') }}"
+      threads: 4
