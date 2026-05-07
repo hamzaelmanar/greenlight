@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Secrets
+.env
+
+# DuckDB data (generated at runtime)
+data/
+
+# Offer artifacts (fetched + extracted, gitignored because .txt is excluded)
+offers/*.txt
+offers/*.json
+
+# dbt build outputs
+transform/target/
+transform/dbt_packages/
+transform/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI context (personal, not part of project)
+claude_context.md
