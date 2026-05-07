@@ -1,8 +1,8 @@
 # Greenlight
 
-> "Get the greenlight to apply."
+<h3 align="center">"Get the greenlight to apply."</h3>
 
-Portfolio gap advisor for data engineers and analytics engineers. You paste job offer URLs and your persona (skills + projects), and Greenlight tells you which project to build next to close the hiring gap.
+Technical portfolio gap advisor for data and analytics engineers.
 
 ## How it works
 
