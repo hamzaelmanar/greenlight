@@ -1,11 +1,16 @@
 """
-app/streamlit_app.py — Greenlight MVP
+app/streamlit_app.py — Greenlight v2
 Run: streamlit run app/streamlit_app.py   (from project root)
+
+Reads from lead-gen's jobs.csv (path via LEAD_GEN_PATH in .env).
+Filters by mission type, city, source, seniority, and minimum relevance score.
 """
 
 import json
-import subprocess
+import os
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -13,113 +18,133 @@ sys.path.insert(0, str(ROOT))
 
 import duckdb
 import streamlit as st
+from dotenv import load_dotenv
 
-from ingestion.extract_skills import extract
-from ingestion.fetch_offer import fetch, save
-from ingestion.load_to_duckdb import load
+load_dotenv(ROOT / ".env")
+
+from ingestion.load_to_duckdb import load, _lead_gen_path
 from scoring.gap_score import get_top_gaps
 from scoring.llm_hook import generate
 
 DB_PATH = ROOT / "data" / "greenlight.duckdb"
-OFFERS_DIR = ROOT / "offers"
-PERSONA_DIR = ROOT / "persona"
-VENV_DBT = ROOT / ".venv" / "Scripts" / "dbt"
+
+MISSION_OPTIONS = [
+    "consulting", "pipeline", "transformation",
+    "analytics_engineering", "data_platform", "cloud_migration",
+]
+CITY_OPTIONS = ["Paris", "Lille", "Nantes", "Lyon", "Malaga", "remote"]
+SOURCE_OPTIONS = ["wttj", "linkedin", "apec"]
+SENIORITY_LABELS = {0: "In range (0–3y)", 1: "Stretch (≤5y)", 2: "All"}
 
 
-def parse_urls(text: str) -> list[str]:
-    urls = []
-    for line in text.splitlines():
-        line = line.strip().lstrip("- ").strip()
-        if line.startswith("http"):
-            urls.append(line)
-    return urls
+def _load_persona_prose() -> str | None:
+    persona_path = _lead_gen_path() / "backend" / "persona.md"
+    if persona_path.exists():
+        return persona_path.read_text(encoding="utf-8")
+    return None
 
 
-def parse_target_roles(md_text: str) -> list[str]:
-    lines = md_text.splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == "## Target roles" and i + 1 < len(lines):
-            return [r.strip() for r in lines[i + 1].split(",") if r.strip()]
-    return ["Analytics Engineer", "Data Engineer"]
+def _build_filter_ctx(missions, cities, sources, max_seniority, min_score, offer_count) -> str:
+    parts = [f"{offer_count} offer{'s' if offer_count != 1 else ''}"]
+    if missions:
+        parts.append(" · ".join(missions))
+    if cities:
+        parts.append(" · ".join(cities))
+    if sources:
+        parts.append(" · ".join(sources))
+    parts.append(SENIORITY_LABELS[max_seniority])
+    parts.append(f"score ≥ {min_score}")
+    return " · ".join(parts)
 
 
-def run_pipeline(persona_path: Path, urls: list[str], mode: str) -> dict:
-    # 1. Fetch + extract offer skills
-    for url in urls:
-        text = fetch(url)
-        path = save(url, text)
-        counts = extract(path.read_text(encoding="utf-8"))
-        out = path.with_name(path.stem + "_skills.json")
-        out.write_text(json.dumps(counts, indent=2), encoding="utf-8")
+def _build_cohort_name(missions: list, cities: list, sources: list) -> str:
+    city_part = "-".join(c[:2].upper() for c in cities) if cities else "all"
+    source_part = "+".join(sources) if sources else "all"
+    consulting_part = "c" if "consulting" in missions else "nc"
+    return f"{city_part}_{source_part}_{consulting_part}"
 
-    # 2. Load into DuckDB
-    DB_PATH.parent.mkdir(exist_ok=True)
-    con = duckdb.connect(str(DB_PATH))
-    load(con, persona_path=persona_path)
-    con.close()
 
-    # 3. dbt run
-    result = subprocess.run(
-        [str(VENV_DBT), "run", "--profiles-dir", "."],
-        cwd=ROOT / "transform",
-        capture_output=True,
-        text=True,
+def _log_run(con, filters: dict, offer_count: int, gaps: list, rec: dict):
+    con.execute(
+        """INSERT INTO run_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(uuid.uuid4()),
+            datetime.now(timezone.utc),
+            json.dumps(filters),
+            offer_count,
+            json.dumps(gaps[:5]),
+            rec.get("hook", ""),
+            rec.get("context", ""),
+            rec.get("project_spec", ""),
+        ),
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"dbt run failed:\n{result.stdout}\n{result.stderr}")
 
-    # 4. Score + recommend
-    gaps = get_top_gaps(10)
-    target_roles = parse_target_roles(persona_path.read_text(encoding="utf-8"))
-    rec = generate(gaps, target_roles, mode=mode)
-    return {"gaps": gaps, "rec": rec}
+
+def _read_run_log() -> list[dict]:
+    try:
+        con = duckdb.connect(str(DB_PATH), read_only=True)
+        rows = con.execute(
+            "SELECT run_id, run_at, filters, offer_count, hook FROM run_log ORDER BY run_at DESC LIMIT 10"
+        ).fetchall()
+        con.close()
+        return [
+            {"run_id": r[0], "run_at": r[1], "filters": r[2], "offer_count": r[3], "hook": r[4]}
+            for r in rows
+        ]
+    except Exception:
+        return []
 
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Greenlight", page_icon="🟢", layout="wide")
 
-# ── Sidebar — inputs ─────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.title("🟢 Greenlight")
-    st.caption("Portfolio gap advisor")
+    st.caption("Portfolio gap advisor — powered by lead-gen")
     st.divider()
 
-    st.subheader("1. Persona")
-    uploaded_persona = st.file_uploader(
-        "Upload your persona `.md` file",
-        type=["md"],
-        help="Should have a `## Skills` section with skill | level | in_prod rows.",
-    )
-    if uploaded_persona is None:
-        default_persona = PERSONA_DIR / "hamza.md"
-        if default_persona.exists():
-            st.caption(f"Using default: `persona/hamza.md`")
-            persona_path = default_persona
-        else:
-            st.warning("No persona file found. Upload one to continue.")
-            persona_path = None
-    else:
-        PERSONA_DIR.mkdir(exist_ok=True)
-        persona_path = PERSONA_DIR / "uploaded.md"
-        persona_path.write_bytes(uploaded_persona.getvalue())
-        st.caption(f"Using uploaded: `{uploaded_persona.name}`")
+    st.subheader("Filters")
 
-    st.subheader("2. Job offers")
-    url_input = st.text_area(
-        "Paste URLs (one per line, or paste your `offers.md` content)",
-        height=200,
-        placeholder="https://www.welcometothejungle.com/fr/companies/...\nhttps://...",
+    missions = st.multiselect(
+        "Mission type",
+        options=MISSION_OPTIONS,
+        default=[],
+        help="Leave empty to include all mission types.",
     )
 
-    use_cached = st.checkbox(
-        "Skip re-fetching (use already-fetched offers)",
-        value=True,
-        help="Check this if you already ran the pipeline — avoids redundant HTTP requests.",
+    cities = st.multiselect(
+        "City",
+        options=CITY_OPTIONS,
+        default=[],
+        help="Matches against the location field. Leave empty for all cities.",
     )
 
-    st.subheader("3. Recommendation mode")
+    sources = st.multiselect(
+        "Source",
+        options=SOURCE_OPTIONS,
+        default=[],
+        help="Leave empty to include all sources.",
+    )
+
+    max_seniority = st.radio(
+        "Seniority cap",
+        options=[0, 1, 2],
+        format_func=lambda x: SENIORITY_LABELS[x],
+        index=1,
+        help="0 = clearly in range (0–3y). 1 = stretch (3–5y). 2 = include all.",
+    )
+
+    min_score = st.slider(
+        "Minimum relevance score",
+        min_value=0, max_value=10, value=6,
+        help="Only offers scored ≥ this value by lead-gen are included.",
+    )
+
+    st.divider()
+    st.subheader("Recommendation mode")
     mode = st.radio(
         "Engine",
         options=["llm", "fallback"],
@@ -130,66 +155,71 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("Run analysis", type="primary", use_container_width=True)
 
-# ── Main — results ────────────────────────────────────────────────────────────
+    cohort_name = _build_cohort_name(missions, cities, sources)
+    st.caption(f"Cohort: `{cohort_name}`")
+
+    # Previous runs
+    history = _read_run_log()
+    if history:
+        st.divider()
+        with st.expander(f"Previous runs ({len(history)})"):
+            for h in history:
+                try:
+                    f = json.loads(h["filters"])
+                except Exception:
+                    f = {}
+                st.caption(str(h["run_at"])[:16])
+                st.markdown(f"**{h['offer_count']} offers** — {h['hook'][:80]}…" if h["hook"] else f"**{h['offer_count']} offers**")
+                st.markdown("---")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 st.header("Results")
 
 if not run_btn:
-    st.info(
-        "Configure your persona and job offers in the sidebar, then click **Run analysis**.",
-        icon="👈",
-    )
+    st.info("Set your filters in the sidebar and click **Run analysis**.", icon="👈")
     st.stop()
-
-if persona_path is None:
-    st.error("No persona file available. Upload one in the sidebar.")
-    st.stop()
-
-urls = parse_urls(url_input)
-
-if not urls and not use_cached:
-    st.error("No URLs found. Paste at least one job offer URL in the sidebar.")
-    st.stop()
-
-if not urls and use_cached:
-    existing = list(OFFERS_DIR.glob("*_skills.json"))
-    if not existing:
-        st.error("No cached offers found and no URLs provided. Paste URLs and uncheck 'Skip re-fetching'.")
-        st.stop()
-    urls = []  # pipeline will use what's already in offers/
 
 with st.status("Running pipeline…", expanded=True) as status:
     try:
-        if urls:
-            st.write(f"Fetching {len(urls)} offer(s)…")
-        else:
-            st.write("Using cached offer files…")
+        st.write("Loading offers from lead-gen…")
+        DB_PATH.parent.mkdir(exist_ok=True)
+        con = duckdb.connect(str(DB_PATH))
+        offer_count = load(
+            con,
+            mission_types=missions or None,
+            cities=cities or None,
+            sources=sources or None,
+            max_seniority=max_seniority,
+            min_score=min_score,
+        )
 
-        if use_cached and not urls:
-            # Skip fetch/extract — jump straight to load + dbt + score
-            DB_PATH.parent.mkdir(exist_ok=True)
-            con = duckdb.connect(str(DB_PATH))
-            load(con, persona_path=persona_path)
+        if offer_count == 0:
             con.close()
+            status.update(label="No offers matched", state="error", expanded=True)
+            st.error("No offers matched your filters. Try relaxing the criteria.")
+            st.stop()
 
-            st.write("Running dbt transformations…")
-            dbt_result = subprocess.run(
-                [str(VENV_DBT), "run", "--profiles-dir", "."],
-                cwd=ROOT / "transform",
-                capture_output=True,
-                text=True,
-            )
-            if dbt_result.returncode != 0:
-                raise RuntimeError(f"dbt run failed:\n{dbt_result.stdout}\n{dbt_result.stderr}")
+        # Close write connection before reading (DuckDB: one writer at a time)
+        con.close()
 
-            st.write(f"Scoring gaps ({mode} mode)…")
-            gaps = get_top_gaps(10)
-            target_roles = parse_target_roles(persona_path.read_text(encoding="utf-8"))
-            rec = generate(gaps, target_roles, mode=mode)
-            data = {"gaps": gaps, "rec": rec}
-        else:
-            st.write("Running full pipeline…")
-            data = run_pipeline(persona_path, urls, mode)
+        st.write(f"Scoring gaps ({mode} mode)…")
+        gaps = get_top_gaps(10)
+
+        filters = {
+            "missions": missions, "cities": cities, "sources": sources,
+            "max_seniority": max_seniority, "min_score": min_score,
+            "cohort": cohort_name,
+        }
+        filter_ctx = _build_filter_ctx(missions, cities, sources, max_seniority, min_score, offer_count)
+        persona_prose = _load_persona_prose()
+
+        rec = generate(gaps, filter_ctx=filter_ctx, persona_prose=persona_prose, mode=mode)
+
+        # Reopen for logging only
+        con = duckdb.connect(str(DB_PATH))
+        _log_run(con, filters, offer_count, gaps, rec)
+        con.close()
 
         status.update(label="Done", state="complete", expanded=False)
 
@@ -198,12 +228,13 @@ with st.status("Running pipeline…", expanded=True) as status:
         st.exception(exc)
         st.stop()
 
-gaps = data["gaps"]
-rec = data["rec"]
-
 if not gaps:
-    st.warning("No skill gaps found. Try adding more job offers.")
+    st.warning("No skill gaps found in the filtered offers.")
     st.stop()
+
+# ── Filter context badge ──────────────────────────────────────────────────────
+
+st.caption(f"Analysis scope: **{filter_ctx}** — cohort `{cohort_name}`")
 
 # ── Gap table ─────────────────────────────────────────────────────────────────
 
@@ -214,11 +245,10 @@ import pandas as pd
 df = pd.DataFrame(rec["top_gaps"])
 df = df.rename(columns={
     "skill": "Skill",
-    "offer_count": "Offer count",
+    "offer_count": "Offers missing you",
     "gap_score": "Gap score",
-    "proficiency": "Your level",
 })
-df["Gap score"] = df["Gap score"].round(1)
+df["Gap score"] = df["Gap score"].apply(lambda x: round(float(x), 1))
 
 st.dataframe(
     df,
@@ -229,7 +259,7 @@ st.dataframe(
             "Gap score",
             min_value=0,
             max_value=float(df["Gap score"].max()) if not df.empty else 10,
-            format="%.1f",
+            format="%.0f",
         ),
     },
 )
