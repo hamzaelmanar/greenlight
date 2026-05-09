@@ -25,5 +25,9 @@ transform/logs/
 .DS_Store
 Thumbs.db
 
+# Offer cache (now sourced from lead-gen, not committed here)
+offers/
+
 # AI context (personal, not part of project)
 claude_context.md
+lead-gen-tasks.md
