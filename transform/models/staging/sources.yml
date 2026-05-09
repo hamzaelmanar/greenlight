@@ -3,34 +3,17 @@ version: 2
 sources:
   - name: raw
     schema: main
-    description: "Raw tables loaded by ingestion/load_to_duckdb.py"
+    description: "Raw tables loaded by ingestion/load_to_duckdb.py from lead-gen jobs.csv"
     tables:
-      - name: raw_persona_skills
-        description: "Skills parsed from the user's persona .md file"
-        columns:
-          - name: skill
-            description: "Lowercase skill name"
-            tests: [not_null, unique]
-          - name: proficiency
-            description: "1 = aware, 2 = used, 3 = strong"
-            tests:
-              - not_null
-              - accepted_values:
-                  arguments:
-                    values: [0, 1, 2, 3]
-          - name: in_production
-            description: "Whether the skill was used in a production context"
-            tests: [not_null]
-
       - name: raw_offer_skills
-        description: "Skill mentions extracted from fetched job offers"
+        description: "Missing skills unpacked from lead-gen scored offers (one row per offer × skill)"
         columns:
           - name: offer_id
-            description: "MD5 slug of the source URL"
+            description: "MD5 slug of the offer URL"
             tests: [not_null]
           - name: skill
-            description: "Lowercase skill name"
+            description: "Lowercase skill name from missing_skills field"
             tests: [not_null]
           - name: mention_count
-            description: "Number of times the skill appeared in the offer text"
+            description: "Always 1 — presence flag, frequency aggregated in skill_frequency mart"
             tests: [not_null]
