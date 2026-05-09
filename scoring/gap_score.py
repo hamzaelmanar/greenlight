@@ -1,7 +1,7 @@
 """
 gap_score.py
-Usage: python scoring/gap_score.py
-Reads persona_gap from DuckDB and returns top N gaps as a list of dicts.
+Aggregates missing_skills frequency directly from raw_offer_skills in DuckDB.
+No dbt run required — the aggregation is trivial and runs inline.
 """
 
 from pathlib import Path
@@ -13,15 +13,18 @@ DB_PATH = Path(__file__).parent.parent / "data" / "greenlight.duckdb"
 def get_top_gaps(n: int = 10) -> list[dict]:
     con = duckdb.connect(str(DB_PATH), read_only=True)
     rows = con.execute(f"""
-        select skill, offer_count, gap_score, proficiency_label
-        from persona_gap
-        where gap_score > 0
+        select
+            skill,
+            count(distinct offer_id) as offer_count,
+            count(distinct offer_id) as gap_score
+        from raw_offer_skills
+        group by skill
         order by gap_score desc
         limit {n}
     """).fetchall()
     con.close()
     return [
-        {"skill": r[0], "offer_count": r[1], "gap_score": r[2], "proficiency": r[3]}
+        {"skill": r[0], "offer_count": r[1], "gap_score": r[2]}
         for r in rows
     ]
 
@@ -29,7 +32,7 @@ def get_top_gaps(n: int = 10) -> list[dict]:
 if __name__ == "__main__":
     gaps = get_top_gaps()
     print("\nTop skill gaps:")
-    print(f"{'Skill':<20} {'Offers':>8} {'Gap score':>12} {'Your level':<12}")
-    print("-" * 56)
+    print(f"{'Skill':<20} {'Offers':>8} {'Gap score':>12}")
+    print("-" * 44)
     for g in gaps:
-        print(f"{g['skill']:<20} {g['offer_count']:>8} {g['gap_score']:>12} {g['proficiency']:<12}")
+        print(f"{g['skill']:<20} {g['offer_count']:>8} {g['gap_score']:>12}")
