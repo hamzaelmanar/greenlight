@@ -55,9 +55,11 @@ def load(
     sources: list[str] | None = None,
     max_seniority: int = 1,
     min_score: int = 6,
+    run_id: str | None = None,
 ) -> int:
     """
     Load filtered jobs from lead-gen CSV into raw_offer_skills.
+    Also populates cohort_skills (gaps + confirmed matches) keyed by run_id.
     Returns the number of matched offers.
     """
     csv_path = _lead_gen_path() / "data" / "jobs.csv"
@@ -69,7 +71,8 @@ def load(
     city_filter    = {c.lower() for c in cities} if cities else None
     source_filter  = {s.lower() for s in sources} if sources else None
 
-    rows: list[tuple[str, str, int]] = []  # (offer_id, skill, mention_count)
+    rows: list[tuple[str, str, int]] = []        # (offer_id, skill, mention_count)
+    cohort_rows: list[tuple] = []                  # (offer_id, skill, has_skill)
     matched_offers: set[str] = set()
 
     with open(csv_path, encoding="utf-8") as f:
@@ -118,8 +121,15 @@ def load(
             for skill in missing:
                 if skill:
                     rows.append((offer_id, skill, 1))
+                    cohort_rows.append((offer_id, skill, False))
 
-    # Write to DuckDB
+            # --- Confirmed matches (skills you already have that this job demands) ---
+            matched = _parse_list_field(job.get("matched_skills", ""))
+            for skill in matched:
+                if skill:
+                    cohort_rows.append((offer_id, skill, True))
+
+    # Write raw_offer_skills
     con.execute("DROP TABLE IF EXISTS raw_offer_skills")
     con.execute("""
         CREATE TABLE raw_offer_skills (
@@ -130,6 +140,23 @@ def load(
     """)
     if rows:
         con.executemany("INSERT INTO raw_offer_skills VALUES (?, ?, ?)", rows)
+
+    # Ensure cohort_skills table exists (append-only across runs)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cohort_skills (
+            run_id      VARCHAR,
+            offer_id    VARCHAR,
+            skill       VARCHAR,
+            has_skill   BOOLEAN
+        )
+    """)
+    if run_id and cohort_rows:
+        # Remove any previous rows for this run_id (idempotent re-runs)
+        con.execute("DELETE FROM cohort_skills WHERE run_id = ?", [run_id])
+        con.executemany(
+            "INSERT INTO cohort_skills VALUES (?, ?, ?, ?)",
+            [(run_id, r[0], r[1], r[2]) for r in cohort_rows],
+        )
 
     # Ensure run_log table exists
     con.execute("""

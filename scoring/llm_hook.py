@@ -234,7 +234,15 @@ def generate(
     if mode == "fallback":
         return generate_fallback(gaps, filter_ctx=filter_ctx)
     if mode == "llm":
-        return generate_llm(gaps, filter_ctx=filter_ctx, persona_prose=persona_prose)
+        try:
+            return generate_llm(gaps, filter_ctx=filter_ctx, persona_prose=persona_prose)
+        except Exception as exc:
+            msg = str(exc)
+            if "429" in msg or "capacity" in msg.lower() or "rate" in msg.lower():
+                result = generate_fallback(gaps, filter_ctx=filter_ctx)
+                result["hook"] = "[Rate limit — fallback] " + result["hook"]
+                return result
+            raise
     raise NotImplementedError(f"Unknown mode: {mode}")
 
 

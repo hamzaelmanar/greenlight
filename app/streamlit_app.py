@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from ingestion.load_to_duckdb import load, _lead_gen_path
-from scoring.gap_score import get_top_gaps
+from scoring.gap_score import get_top_gaps, get_cohort_names, get_cohort_comparison
 from scoring.llm_hook import generate
 
 DB_PATH = ROOT / "data" / "greenlight.duckdb"
@@ -64,11 +64,11 @@ def _build_cohort_name(missions: list, cities: list, sources: list) -> str:
     return f"{city_part}_{source_part}_{consulting_part}"
 
 
-def _log_run(con, filters: dict, offer_count: int, gaps: list, rec: dict):
+def _log_run(con, filters: dict, offer_count: int, gaps: list, rec: dict, run_id: str | None = None):
     con.execute(
         """INSERT INTO run_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            str(uuid.uuid4()),
+            run_id or str(uuid.uuid4()),
             datetime.now(timezone.utc),
             json.dumps(filters),
             offer_count,
@@ -184,6 +184,7 @@ with st.status("Running pipeline…", expanded=True) as status:
     try:
         st.write("Loading offers from lead-gen…")
         DB_PATH.parent.mkdir(exist_ok=True)
+        run_id = str(uuid.uuid4())
         con = duckdb.connect(str(DB_PATH))
         offer_count = load(
             con,
@@ -192,6 +193,7 @@ with st.status("Running pipeline…", expanded=True) as status:
             sources=sources or None,
             max_seniority=max_seniority,
             min_score=min_score,
+            run_id=run_id,
         )
 
         if offer_count == 0:
@@ -218,7 +220,7 @@ with st.status("Running pipeline…", expanded=True) as status:
 
         # Reopen for logging only
         con = duckdb.connect(str(DB_PATH))
-        _log_run(con, filters, offer_count, gaps, rec)
+        _log_run(con, filters, offer_count, gaps, rec, run_id=run_id)
         con.close()
 
         status.update(label="Done", state="complete", expanded=False)
@@ -295,3 +297,49 @@ with col1:
 with col2:
     st.markdown("**Project spec**")
     st.markdown(rec["project_spec"] or "_No project spec generated._")
+
+
+# ── Compare tab ────────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Compare cohorts")
+
+cohorts = get_cohort_names()  # [(run_id, cohort_name, run_at), ...]
+
+if len(cohorts) < 2:
+    st.caption("Run at least two different filter configurations to compare cohorts.")
+else:
+    import pandas as pd
+
+    cohort_labels = {f"{name} ({at})": rid for rid, name, at in cohorts}
+    label_list = list(cohort_labels.keys())
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        sel_a = st.selectbox("Cohort A", label_list, index=0, key="cmp_a")
+    with col_b:
+        sel_b = st.selectbox("Cohort B", label_list, index=min(1, len(label_list) - 1), key="cmp_b")
+
+    if sel_a == sel_b:
+        st.warning("Select two different cohorts.")
+    else:
+        cmp = get_cohort_comparison(cohort_labels[sel_a], cohort_labels[sel_b])
+        if not cmp:
+            st.info("No skill data for these cohorts yet.")
+        else:
+            df_cmp = pd.DataFrame(cmp)
+            df_cmp["Status"] = df_cmp["has_skill"].map({True: "✅ You have it", False: "❌ Gap"})
+            df_cmp = df_cmp.rename(columns={
+                "skill": "Skill",
+                "a_count": f"{sel_a[:30]} offers",
+                "b_count": f"{sel_b[:30]} offers",
+            }).drop(columns=["has_skill"])
+
+            gaps_df = df_cmp[df_cmp["Status"] == "❌ Gap"].drop(columns=["Status"])
+            matches_df = df_cmp[df_cmp["Status"] == "✅ You have it"].drop(columns=["Status"])
+
+            st.markdown("**❌ Gaps** — skills you’re missing that these cohorts demand")
+            st.dataframe(gaps_df, use_container_width=True, hide_index=True)
+
+            st.markdown("**✅ Confirmed matches** — skills you have that these cohorts value")
+            st.dataframe(matches_df, use_container_width=True, hide_index=True)
